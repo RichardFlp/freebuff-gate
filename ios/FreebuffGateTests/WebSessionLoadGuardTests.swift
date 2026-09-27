@@ -5,38 +5,75 @@ final class WebSessionLoadGuardTests: XCTestCase {
 
     func testSuppressesConcurrentAndDuplicateLoads() {
         let loadGuard = WebSessionLoadGuard()
+        let key = "d_1:https://relay.example.test"
 
-        XCTAssertTrue(loadGuard.shouldLoad(key: "d_1:https://relay.example.test"))
-
-        // In flight: a second SwiftUI update must not start another load.
-        loadGuard.begin()
-        XCTAssertFalse(loadGuard.shouldLoad(key: "d_1:https://relay.example.test"))
+        XCTAssertTrue(loadGuard.shouldLoad(key: key))
+        loadGuard.begin(key: key)
+        XCTAssertFalse(loadGuard.shouldLoad(key: key))
         XCTAssertFalse(loadGuard.shouldLoad(key: "d_2:https://relay.example.test"))
-
-        // Completed: the same session must not reload.
-        loadGuard.finish(key: "d_1:https://relay.example.test")
-        XCTAssertFalse(loadGuard.shouldLoad(key: "d_1:https://relay.example.test"))
+        loadGuard.finish(key: key, cookieExpiresAt: .distantFuture)
+        XCTAssertFalse(loadGuard.shouldLoad(key: key))
     }
 
     func testChangedSessionStartsANewLoad() {
         let loadGuard = WebSessionLoadGuard()
-        XCTAssertTrue(loadGuard.shouldLoad(key: "d_1:https://relay.example.test"))
-        loadGuard.begin()
-        loadGuard.finish(key: "d_1:https://relay.example.test")
+        loadGuard.begin(key: "d_1:https://relay.example.test")
+        loadGuard.finish(key: "d_1:https://relay.example.test", cookieExpiresAt: .distantFuture)
 
-        // A newly paired device or a different relay URL is a different key.
         XCTAssertTrue(loadGuard.shouldLoad(key: "d_2:https://relay.example.test"))
         XCTAssertTrue(loadGuard.shouldLoad(key: "d_1:https://other.example.test"))
     }
 
+    func testFailureAllowsRetryOnlyWhenRequested() {
+        let loadGuard = WebSessionLoadGuard()
+        let key = "d_1:https://relay.example.test"
+        loadGuard.begin(key: key)
+        loadGuard.fail(key: key)
+
+        XCTAssertFalse(loadGuard.shouldLoad(key: key))
+        XCTAssertTrue(loadGuard.shouldLoad(key: "d_2:https://relay.example.test"))
+        loadGuard.retry(key: key)
+        XCTAssertTrue(loadGuard.shouldLoad(key: key))
+    }
+
     func testInvalidateAllowsReloadAfterRevocation() {
         let loadGuard = WebSessionLoadGuard()
-        loadGuard.begin()
-        loadGuard.finish(key: "d_1:https://relay.example.test")
-        XCTAssertFalse(loadGuard.shouldLoad(key: "d_1:https://relay.example.test"))
+        let key = "d_1:https://relay.example.test"
+        loadGuard.begin(key: key)
+        loadGuard.finish(key: key, cookieExpiresAt: .distantFuture)
+        XCTAssertFalse(loadGuard.shouldLoad(key: key))
 
         loadGuard.invalidate()
+        XCTAssertTrue(loadGuard.shouldLoad(key: key))
+    }
+
+    func testInvalidatingInFlightKeyAllowsReplacementLoad() {
+        let loadGuard = WebSessionLoadGuard()
+        loadGuard.begin(key: "d_1:https://relay.example.test")
+        loadGuard.invalidate()
+
+        let replacement = "d_2:https://relay.example.test"
+        XCTAssertTrue(loadGuard.shouldLoad(key: replacement))
+        loadGuard.begin(key: replacement)
+        loadGuard.finish(key: replacement, cookieExpiresAt: .distantFuture)
+        loadGuard.finish(key: "d_1:https://relay.example.test", cookieExpiresAt: .distantFuture)
+
+        XCTAssertFalse(loadGuard.shouldLoad(key: replacement))
         XCTAssertTrue(loadGuard.shouldLoad(key: "d_1:https://relay.example.test"))
+    }
+
+    func testExpiredCookieEnablesRefreshButFreshCookieDoesNot() {
+        let loadGuard = WebSessionLoadGuard()
+        let key = "d_1:https://relay.example.test"
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        loadGuard.begin(key: key)
+        loadGuard.finish(key: key, cookieExpiresAt: now.addingTimeInterval(7 * 24 * 60 * 60))
+        loadGuard.refreshIfCookieExpiresSoon(key: key, now: now)
+        XCTAssertFalse(loadGuard.shouldLoad(key: key))
+
+        loadGuard.refreshIfCookieExpiresSoon(key: key, now: now.addingTimeInterval(7 * 24 * 60 * 60))
+        XCTAssertTrue(loadGuard.shouldLoad(key: key))
     }
 
     func testSessionKeyIgnoresAccessTokenRotation() throws {
@@ -45,16 +82,8 @@ final class WebSessionLoadGuardTests: XCTestCase {
         let rotated = makeSession(deviceId: "d_1", accessToken: "token-b")
         let otherDevice = makeSession(deviceId: "d_2", accessToken: "token-a")
 
-        // Rotating the short-lived access token must reuse the loaded page.
-        XCTAssertEqual(
-            WebSessionKey.make(session: first, url: url),
-            WebSessionKey.make(session: rotated, url: url)
-        )
-        // A different device (new pairing) or URL must not.
-        XCTAssertNotEqual(
-            WebSessionKey.make(session: first, url: url),
-            WebSessionKey.make(session: otherDevice, url: url)
-        )
+        XCTAssertEqual(WebSessionKey.make(session: first, url: url), WebSessionKey.make(session: rotated, url: url))
+        XCTAssertNotEqual(WebSessionKey.make(session: first, url: url), WebSessionKey.make(session: otherDevice, url: url))
         XCTAssertNotEqual(
             WebSessionKey.make(session: first, url: url),
             WebSessionKey.make(session: first, url: try XCTUnwrap(URL(string: "https://other.example.test")))

@@ -16,9 +16,10 @@ final class PushTokenStore {
 
     private var deviceToken: String?
     private var session: PairingSession?
-    /// Kept after `session` is cleared so cleanup can still authenticate a
-    /// `DELETE /v1/mobile/push-token` for the device that just disconnected.
     private var lastSession: PairingSession?
+    private var registrationActive = false
+    private var sessionGeneration = 0
+    private var networkTask: Task<Void, Never>?
 
     init(
         upload: @escaping UploadHandler = PushTokenStore.uploadToRelay,
@@ -29,12 +30,16 @@ final class PushTokenStore {
     }
 
     func setDeviceToken(_ token: String) {
-        queue.sync { self.deviceToken = token.isEmpty ? nil : token }
+        queue.sync {
+            self.deviceToken = token.isEmpty ? nil : token
+            self.sessionGeneration += 1
+        }
         uploadIfPossible()
     }
 
     func setSession(_ session: PairingSession?) {
         queue.sync {
+            self.sessionGeneration += 1
             self.session = session
             if let session {
                 self.lastSession = session
@@ -44,29 +49,45 @@ final class PushTokenStore {
     }
 
     func uploadIfPossible() {
-        let pair = queue.sync { () -> (token: String, session: PairingSession)? in
-            guard let token = self.deviceToken, let session = self.session else { return nil }
-            return (token, session)
+        queue.sync {
+            guard let token = self.deviceToken, let session = self.session else { return }
+            self.registrationActive = true
+            let generation = self.sessionGeneration
+            self.enqueueNetworkOperation {
+                await self.upload(session, token)
+                self.queue.async {
+                    guard self.sessionGeneration == generation else { return }
+                    if self.session?.deviceId != session.deviceId {
+                        self.registrationActive = false
+                    }
+                }
+            }
         }
-        guard let pair else { return }
-        Task { await self.upload(pair.session, pair.token) }
     }
 
-    /// Best-effort relay cleanup. Only the first call while a device token is
-    /// held issues a request, so repeated state transitions do not spam
-    /// `DELETE /v1/mobile/push-token`. Failures are swallowed: an
-    /// expired/revoked access token returns 401 and there is nothing left to
-    /// clean up. Local state is cleared regardless, so this never blocks or
-    /// crashes the disconnect path.
+    /// Best-effort relay cleanup. Only the first call while a relay
+    /// registration is active issues a request, so repeated state transitions
+    /// do not spam `DELETE /v1/mobile/push-token`. Requests are serialized so a
+    /// late upload cannot re-register a token after this delete. The APNs token
+    /// remains local so a later pairing can register it again without another
+    /// APNs callback.
     func unregister() {
-        let pending = queue.sync { () -> (token: String?, session: PairingSession?) in
-            let token = self.deviceToken
-            self.deviceToken = nil
+        queue.sync {
+            let shouldErase = self.registrationActive
+            self.registrationActive = false
+            self.sessionGeneration += 1
             self.session = nil
-            return (token, self.lastSession)
+            guard shouldErase, let session = self.lastSession else { return }
+            self.enqueueNetworkOperation { await self.erase(session) }
         }
-        guard pending.token != nil, let session = pending.session else { return }
-        Task { await self.erase(session) }
+    }
+
+    private func enqueueNetworkOperation(_ operation: @escaping () async -> Void) {
+        let previous = networkTask
+        networkTask = Task {
+            await previous?.value
+            await operation()
+        }
     }
 
     private static func uploadToRelay(session: PairingSession, token: String) async {
@@ -76,6 +97,35 @@ final class PushTokenStore {
 
     private static func eraseFromRelay(session: PairingSession) async {
         guard let api = try? PairingApi(rawBaseUrl: session.gatewayBaseUrl) else { return }
-        try? await api.deletePushToken(session: session)
+        await eraseSession(
+            session,
+            refresh: { try await api.refresh(session: $0) },
+            delete: { try? await api.deletePushToken(session: $0) }
+        )
+    }
+
+    /// Refreshes an expired access token before cleanup. Kept as the production
+    /// path and injected at the HTTP boundary so tests verify refresh selection
+    /// and which session is actually used for DELETE.
+    static func eraseSession(
+        _ session: PairingSession,
+        now: Date = Date(),
+        refresh: (PairingSession) async throws -> PairingSession,
+        delete: (PairingSession) async -> Void
+    ) async {
+        var deleteSession = session
+        if !ReconnectController.isTokenFresh(
+            expiresAt: session.accessTokenExpiresAt,
+            now: now,
+            minimumValidity: 30
+        ) {
+            do {
+                deleteSession = try await refresh(session)
+            } catch {
+                // An expired or revoked device may no longer be cleanable with
+                // its access token; the relay will reject the best-effort DELETE.
+            }
+        }
+        await delete(deleteSession)
     }
 }

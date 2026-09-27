@@ -16,10 +16,10 @@ restricted WKWebView, and reconnect with jittered exponential backoff.
 | `FreebuffGate/DeviceIdentity.swift` | EC P-256 keypair (Secure Enclave, Keychain fallback) |
 | `FreebuffGate/SecureSessionStore.swift` | AES-GCM encrypted session in the Keychain |
 | `FreebuffGate/QrScannerView.swift` | AVFoundation QR scanner |
-| `FreebuffGate/RestrictedWebViewController.swift` | WKWebView locked to the relay origin |
+| `FreebuffGate/RestrictedWebViewController.swift` | WKWebView locked to the relay origin and validates cookie installation |
 | `FreebuffGate/ReconnectController.swift` | Network monitoring, serialized connect, jittered backoff |
-| `FreebuffGate/WebSessionLoadGuard.swift` | Suppresses duplicate web-session loads |
-| `FreebuffGate/OriginConfig.swift` | Parses configured relay origins from Info.plist |
+| `FreebuffGate/WebSessionLoadGuard.swift` | Suppresses duplicate web-session loads and tracks cookie expiry |
+| `FreebuffGate/OriginConfig.swift` | Parses configured relay origins and pins UI origin |
 | `FreebuffGateTests/` | Unit tests (see below) |
 | `ExportOptions.plist` | Local ad-hoc export template; CI generates a filled copy |
 
@@ -55,19 +55,35 @@ production origin is hardcoded in Swift:
 - `FBDefaultPairingOrigin` ← `FB_DEFAULT_PAIRING_ORIGIN`
 - `FBDefaultWebOrigin` ← `FB_DEFAULT_WEB_ORIGIN`
 
-Both default to empty. A generic build pairs against the exact HTTPS origin in
-the scanned QR and pins the WebView to the relay origin returned by the claim.
-A production or CI build overrides the settings so only one known relay origin
-is accepted:
+Both default to empty. A generic build pairs against the HTTPS origin in the
+scanned QR and pins the WebView to that pairing relay origin. A claimed UI URL
+on another origin is rejected, so the bearer access token is never sent to an
+unrelated host. A production or CI build may configure a separate, known UI
+origin:
 
 ```bash
 xcodebuild ... \
   FB_DEFAULT_PAIRING_ORIGIN=https://relay.example.com \
-  FB_DEFAULT_WEB_ORIGIN=https://relay.example.com
+  FB_DEFAULT_WEB_ORIGIN=https://ui.example.com
 ```
 
 An insecure, credentialed, or malformed value is rejected at parse time, never
-accepted.
+accepted. An invalid non-empty configuration fails closed; it is not treated as
+an absent pin.
+
+## Web session cookie
+
+The app requests `/v1/mobile/session` with native HTTPS and keeps the access
+token out of page JavaScript. It accepts only `__Host-freebuff_session` with
+`Secure`, `HttpOnly`, host-only scope and root path. WebKit cookie installation
+is verified before navigation; missing or rejected cookies never fall through
+to an unauthenticated UI load.
+
+The relay returns cookie expiry metadata. iOS preserves the loaded page across
+ordinary access-token rotations, but refreshes the cookie after foreground
+resume when it is within 24 hours of expiry. That avoids unnecessary reloads
+while covering an app left in the background beyond the relay's seven-day
+cookie lifetime.
 
 ## APNs environment
 
@@ -76,7 +92,8 @@ accepted.
 Release. It must match the relay's APNs host (`FB_APNS_SANDBOX`). The APNs
 device token is uploaded with the active session and deleted
 (`DELETE /v1/mobile/push-token`) when the user disconnects or the pairing is
-revoked.
+revoked. If its access token has expired, cleanup attempts a device-session
+refresh first and still treats deletion as best-effort.
 
 ## CI
 
@@ -131,16 +148,17 @@ Same posture as the Android app:
   Only the public key is sent to the relay and it has the same encoding either
   way.
 - The session is stored encrypted with AES-GCM under a Keychain key.
-- The WKWebView is restricted to the exact relay origin: no other scheme,
-  host, subdomain, or port is ever loaded, and the access token is never
-  exposed to page JavaScript (only the relay-issued cookie is installed).
+- The WKWebView is restricted to the exact pinned HTTPS origin: no other
+  scheme, host, subdomain, or port is ever loaded. The access token is used
+  only by native requests; only the relay-issued HttpOnly cookie reaches WebView.
 - Non-HTTPS origins, cleartext, and certificate bypasses are refused.
 
 ## Tests
 
 `FreebuffGateTests` covers URL normalization and failure modes, configured
-origin parsing (including rejected origins), exact-origin WebView navigation,
-device identity stability, web-session load suppression, connect-gate
-serialization, backoff/token-freshness math, and push-token upload/cleanup.
+origin parsing and fallback pinning, exact-origin WebView navigation, secure
+cookie parsing and installation policy, cookie expiry tracking, device identity
+stability, connect-gate serialization, backoff/token-freshness math, and
+push-token upload/cleanup (including expired-token refresh selection).
 All run on the Simulator; a device-only run additionally exercises the Secure
 Enclave path.

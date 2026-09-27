@@ -37,6 +37,8 @@ class ReconnectController {
     private var started = false
     private var pendingConnect: DispatchWorkItem?
     private var refreshTask: Task<Void, Never>?
+    private var operationGeneration = 0
+    private var connectRequested = false
 
     init(sessionStore: SecureSessionStore, listener: @escaping Listener) {
         self.sessionStore = sessionStore
@@ -58,7 +60,11 @@ class ReconnectController {
             self.started = true
             self.manualDisconnect = false
             self.monitor.start(queue: self.queue)
-            self.scheduleConnect(immediate: true)
+            if self.gate.isInFlight {
+                self.connectRequested = true
+            } else {
+                self.scheduleConnect(immediate: true)
+            }
         }
     }
 
@@ -69,10 +75,18 @@ class ReconnectController {
                 self.started = true
                 self.manualDisconnect = false
                 self.monitor.start(queue: self.queue)
-                self.scheduleConnect(immediate: true)
+                if self.gate.isInFlight {
+                    self.connectRequested = true
+                } else {
+                    self.scheduleConnect(immediate: true)
+                }
                 return
             }
-            guard !self.manualDisconnect, !self.gate.isInFlight else { return }
+            guard !self.manualDisconnect else { return }
+            guard !self.gate.isInFlight else {
+                self.connectRequested = true
+                return
+            }
             // Skip a redundant refresh while the stored access token is still
             // valid: rotating it here races the web-session exchange that the
             // running WebView just performed (surfaced as a spurious 401).
@@ -87,6 +101,8 @@ class ReconnectController {
     func disconnect(clearSession: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
+            self.operationGeneration += 1
+            self.connectRequested = false
             self.manualDisconnect = true
             self.pendingConnect?.cancel()
             self.pendingConnect = nil
@@ -104,15 +120,22 @@ class ReconnectController {
     func reconnect() {
         queue.async { [weak self] in
             guard let self else { return }
+            self.operationGeneration += 1
             self.manualDisconnect = false
             self.retryAttempt = 0
-            self.scheduleConnect(immediate: true, force: true)
+            if self.gate.isInFlight {
+                self.connectRequested = true
+            } else {
+                self.scheduleConnect(immediate: true, force: true)
+            }
         }
     }
 
     func close() {
         queue.async { [weak self] in
             guard let self else { return }
+            self.operationGeneration += 1
+            self.connectRequested = false
             self.monitor.cancel()
             self.pendingConnect?.cancel()
             self.pendingConnect = nil
@@ -124,8 +147,6 @@ class ReconnectController {
 
     private func scheduleConnect(immediate: Bool, force: Bool = false) {
         if manualDisconnect || !started { return }
-        // One connect at a time. `force` is used by the retry path, which is
-        // invoked from inside an in-flight connect and must still enqueue.
         if !force, gate.isInFlight { return }
         pendingConnect?.cancel()
         let delay = immediate ? 0.0 : retryDelayMs()
@@ -137,11 +158,13 @@ class ReconnectController {
     private func connectOnce() {
         if manualDisconnect { return }
         guard gate.tryBegin() else { return }
+        connectRequested = false
         guard let stored = sessionStore.load() else {
             gate.end()
             emit(.unpaired, "Scan a pairing QR code", nil)
             return
         }
+        let generation = operationGeneration
         let reconnecting = retryAttempt > 0
         emit(
             reconnecting ? .reconnecting : .connecting,
@@ -150,29 +173,57 @@ class ReconnectController {
         )
         Task { [weak self] in
             guard let self else { return }
-            defer { self.queue.async { self.gate.end() } }
+            let result: Result<PairingSession, Error>
             do {
                 let refreshed = try await PairingApi(rawBaseUrl: stored.gatewayBaseUrl).refresh(session: stored)
-                try self.sessionStore.save(session: refreshed)
-                self.queue.async {
+                result = .success(refreshed)
+            } catch {
+                result = .failure(error)
+            }
+            self.queue.async {
+                // Release before handling the result. Retry scheduling must
+                // retain its backoff, while an explicit reconnect received
+                // during this request should run immediately afterward.
+                self.gate.end()
+                let reconnectWasRequested = self.connectRequested
+                self.connectRequested = false
+
+                // Disconnect/reconnect invalidates this response. Never let a
+                // stale refresh restore a cleared session or emit connected.
+                guard Self.isCurrentOperation(
+                    generation: generation,
+                    currentGeneration: self.operationGeneration,
+                    manuallyDisconnected: self.manualDisconnect
+                ) else {
+                    if reconnectWasRequested && !self.manualDisconnect {
+                        self.scheduleConnect(immediate: true)
+                    }
+                    return
+                }
+                switch result {
+                case .success(let refreshed):
+                    do {
+                        try self.sessionStore.save(session: refreshed)
+                    } catch {
+                        self.scheduleRetry(stored, detail: "Waiting for network")
+                        return
+                    }
                     self.retryAttempt = 0
                     self.scheduleSessionRefresh(session: refreshed)
-                }
-                self.emit(.connected, "Gateway authenticated", refreshed)
-            } catch let error as PairingError {
-                switch error {
-                case .http(let status, _) where status == 401 || status == 403:
-                    self.sessionStore.clear()
-                    self.queue.async {
+                    self.emit(.connected, "Gateway authenticated", refreshed)
+                case .failure(let error as PairingError):
+                    switch error {
+                    case .http(let status, _) where status == 401 || status == 403:
+                        self.sessionStore.clear()
                         self.refreshTask?.cancel()
                         self.refreshTask = nil
+                        self.emit(.pairingRequired, "Pairing expired or revoked", nil)
+                    default:
+                        self.scheduleRetry(stored, detail: error.localizedDescription)
                     }
-                    self.emit(.pairingRequired, "Pairing expired or revoked", nil)
-                default:
-                    self.queue.async { self.scheduleRetry(stored, detail: error.localizedDescription) }
+                case .failure:
+                    self.scheduleRetry(stored, detail: "Waiting for network")
                 }
-            } catch {
-                self.queue.async { self.scheduleRetry(stored, detail: "Waiting for network") }
             }
         }
     }
@@ -198,8 +249,6 @@ class ReconnectController {
     private func scheduleRetry(_ session: PairingSession, detail: String) {
         retryAttempt += 1
         emit(.reconnecting, detail, session)
-        // Force: called from inside connectOnce while the gate is still held;
-        // the enqueued retry runs after the in-flight connect releases it.
         scheduleConnect(immediate: false, force: true)
     }
 
@@ -215,6 +264,14 @@ class ReconnectController {
     }
 
     // MARK: - Testable rules
+
+    static func isCurrentOperation(
+        generation: Int,
+        currentGeneration: Int,
+        manuallyDisconnected: Bool
+    ) -> Bool {
+        generation == currentGeneration && !manuallyDisconnected
+    }
 
     /// Jittered exponential backoff base: 1s doubling to a 60s cap.
     static func backoffBaseMs(attempt: Int) -> Double {

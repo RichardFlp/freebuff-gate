@@ -1,4 +1,5 @@
 import XCTest
+import Security
 @testable import FreebuffGate
 
 final class DeviceIdentityTests: XCTestCase {
@@ -27,5 +28,19 @@ final class DeviceIdentityTests: XCTestCase {
         // key, not generate a new one.
         let third = try DeviceIdentity().publicKeyForPairing()
         XCTAssertEqual(first, third)
+    }
+
+    func testSoftwareFallbackIsLimitedToSecureEnclaveUnavailableErrors() {
+        let enclaveUnavailable = NSError(domain: NSOSStatusErrorDomain, code: Int(errSecNotAvailable))
+        let unsupportedParameters = NSError(domain: NSOSStatusErrorDomain, code: Int(errSecParam))
+        let unimplemented = NSError(domain: NSOSStatusErrorDomain, code: Int(errSecUnimplemented))
+        let keychainFailure = NSError(domain: NSOSStatusErrorDomain, code: Int(errSecAuthFailed))
+        let unrelatedFailure = NSError(domain: "TestError", code: Int(errSecNotAvailable))
+
+        XCTAssertTrue(DeviceIdentity.canUseSoftwareKey(afterSecureEnclaveError: enclaveUnavailable))
+        XCTAssertTrue(DeviceIdentity.canUseSoftwareKey(afterSecureEnclaveError: unsupportedParameters))
+        XCTAssertTrue(DeviceIdentity.canUseSoftwareKey(afterSecureEnclaveError: unimplemented))
+        XCTAssertFalse(DeviceIdentity.canUseSoftwareKey(afterSecureEnclaveError: keychainFailure))
+        XCTAssertFalse(DeviceIdentity.canUseSoftwareKey(afterSecureEnclaveError: unrelatedFailure))
     }
 }

@@ -1,5 +1,32 @@
 import Foundation
 
+struct WebSessionCredential {
+    let cookieHeader: String
+    let expiresAt: Date
+
+    static func parse(
+        cookieHeader: String?,
+        expiresAt rawExpiry: String?,
+        now: Date = Date()
+    ) throws -> WebSessionCredential {
+        guard let cookieHeader, !cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PairingError.badResponse("Relay did not return a session cookie")
+        }
+        guard let rawExpiry, let expiresAt = parseDate(rawExpiry), expiresAt > now else {
+            throw PairingError.badResponse("Relay did not return a valid session cookie expiry")
+        }
+        return WebSessionCredential(cookieHeader: cookieHeader, expiresAt: expiresAt)
+    }
+
+    private static func parseDate(_ raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: raw) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: raw)
+    }
+}
+
 class PairingApi {
     let baseUrl: String
 
@@ -53,12 +80,8 @@ class PairingApi {
         )
     }
 
-    /// Exchanges short-lived access token for relay-owned Secure/HttpOnly
-    /// cookie. The cookie is installed into the WKWebView cookie store by
-    /// native code; the access token is never injected into page JavaScript.
-    /// Registers (or clears, with an empty token) the device's APNs token
-    /// with the relay so it can push turn-finished notifications while the
-    /// app is backgrounded.
+    /// Registers the device's APNs token with the relay so it can push
+    /// turn-finished notifications while the app is backgrounded.
     func uploadPushToken(session: PairingSession, token: String) async throws {
         guard session.gatewayBaseUrl == baseUrl else {
             throw PairingError.invalidUrl("Session endpoint changed")
@@ -75,7 +98,7 @@ class PairingApi {
 
     /// Best-effort relay cleanup so a disconnected or revoked pairing stops
     /// receiving APNs pushes. An already-expired access token returns 401,
-    /// which callers ignore: the relay no longer has a live session for it.
+    /// which callers may ignore.
     func deletePushToken(session: PairingSession) async throws {
         guard session.gatewayBaseUrl == baseUrl else {
             throw PairingError.invalidUrl("Session endpoint changed")
@@ -89,7 +112,10 @@ class PairingApi {
         )
     }
 
-    func establishWebSession(webBaseUrl: String, accessToken: String) async throws -> String {
+    /// Exchanges a short-lived access token for a relay-owned Secure/HttpOnly
+    /// cookie and validates expiry metadata so the cookie can be renewed after
+    /// a long period in the background. The access token is never exposed to JS.
+    func establishWebSession(webBaseUrl: String, accessToken: String) async throws -> WebSessionCredential {
         let webOrigin = try Self.normalizeBaseUrl(webBaseUrl)
         let result = try await request(
             baseUrl: webOrigin,
@@ -98,10 +124,10 @@ class PairingApi {
             body: nil,
             headers: ["Authorization": "Bearer \(accessToken)"]
         )
-        guard let cookie = result.setCookie, !cookie.isEmpty else {
-            throw PairingError.badResponse("Relay did not return a session cookie")
-        }
-        return cookie
+        return try WebSessionCredential.parse(
+            cookieHeader: result.setCookie,
+            expiresAt: result.json["expiresAt"] as? String
+        )
     }
 
     /// Normalizes an endpoint to `https://host[:port]` with a lowercased host,

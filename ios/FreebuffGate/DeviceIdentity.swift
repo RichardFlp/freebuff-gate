@@ -36,12 +36,12 @@ final class DeviceIdentity {
         if let existing = try loadKey() {
             return existing
         }
-        // Prefer the Secure Enclave; fall back to a software key when the
-        // hardware/Simulator cannot host one.
-        if let enclaveKey = try? createKey(secureEnclave: true) {
-            return enclaveKey
+        do {
+            return try createKey(secureEnclave: true)
+        } catch {
+            guard Self.canUseSoftwareKey(afterSecureEnclaveError: error) else { throw error }
+            return try createKey(secureEnclave: false)
         }
-        return try createKey(secureEnclave: false)
     }
 
     private func loadKey() throws -> SecKey? {
@@ -97,6 +97,18 @@ final class DeviceIdentity {
             throw error?.takeRetainedValue() as? Error ?? KeychainError.unexpected("Could not create device key")
         }
         return key
+    }
+
+    /// The Security framework reports unsupported Secure Enclave key requests
+    /// as parameter-not-supported/unavailable errors on simulator and older
+    /// devices. Other failures may indicate a Keychain or signing problem and
+    /// must remain visible rather than silently weakening key protection.
+    static func canUseSoftwareKey(afterSecureEnclaveError error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSOSStatusErrorDomain else { return false }
+        return nsError.code == Int(errSecParam)
+            || nsError.code == Int(errSecNotAvailable)
+            || nsError.code == Int(errSecUnimplemented)
     }
 }
 

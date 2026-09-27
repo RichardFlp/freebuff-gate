@@ -60,4 +60,10 @@ final class ReconnectControllerTests: XCTestCase {
         XCTAssertFalse(ReconnectController.isTokenFresh(expiresAt: "not-a-date"))
         XCTAssertFalse(ReconnectController.isTokenFresh(expiresAt: ""))
     }
+
+    func testCompletionIsCurrentOnlyForMatchingOperationGeneration() {
+        XCTAssertTrue(ReconnectController.isCurrentOperation(generation: 4, currentGeneration: 4, manuallyDisconnected: false))
+        XCTAssertFalse(ReconnectController.isCurrentOperation(generation: 4, currentGeneration: 5, manuallyDisconnected: false))
+        XCTAssertFalse(ReconnectController.isCurrentOperation(generation: 4, currentGeneration: 4, manuallyDisconnected: true))
+    }
 }
