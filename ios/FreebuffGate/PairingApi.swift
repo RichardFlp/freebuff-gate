@@ -3,8 +3,11 @@ import Foundation
 class PairingApi {
     let baseUrl: String
 
-    init(rawBaseUrl: String) {
-        self.baseUrl = Self.normalizeBaseUrl(rawBaseUrl)
+    /// - Throws: `PairingError.invalidUrl` when the endpoint is not a valid,
+    ///   credential-free HTTPS origin. Callers surface this through the normal
+    ///   pairing error path; it must never terminate the process.
+    init(rawBaseUrl: String) throws {
+        self.baseUrl = try Self.normalizeBaseUrl(rawBaseUrl)
     }
 
     func claim(payload: PairingPayload, deviceName: String, devicePublicKey: String) async throws -> PairingSession {
@@ -70,8 +73,24 @@ class PairingApi {
         )
     }
 
+    /// Best-effort relay cleanup so a disconnected or revoked pairing stops
+    /// receiving APNs pushes. An already-expired access token returns 401,
+    /// which callers ignore: the relay no longer has a live session for it.
+    func deletePushToken(session: PairingSession) async throws {
+        guard session.gatewayBaseUrl == baseUrl else {
+            throw PairingError.invalidUrl("Session endpoint changed")
+        }
+        _ = try await request(
+            baseUrl: baseUrl,
+            path: "/v1/mobile/push-token",
+            method: "DELETE",
+            body: nil,
+            headers: ["Authorization": "Bearer \(session.accessToken)"]
+        )
+    }
+
     func establishWebSession(webBaseUrl: String, accessToken: String) async throws -> String {
-        let webOrigin = Self.normalizeBaseUrl(webBaseUrl)
+        let webOrigin = try Self.normalizeBaseUrl(webBaseUrl)
         let result = try await request(
             baseUrl: webOrigin,
             path: "/v1/mobile/session",
@@ -85,19 +104,30 @@ class PairingApi {
         return cookie
     }
 
-    static func normalizeBaseUrl(_ raw: String) -> String {
+    /// Normalizes an endpoint to `https://host[:port]` with a lowercased host,
+    /// dropping any path, query, fragment, or trailing slash.
+    ///
+    /// - Throws: `PairingError.invalidUrl` for empty input, a malformed URL, a
+    ///   non-HTTPS scheme, a missing host, or embedded credentials.
+    static func normalizeBaseUrl(_ raw: String) throws -> String {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let uri = URL(string: text), uri.scheme?.lowercased() == "https" else {
-            fatalError("Gateway endpoint must use HTTPS")
+        guard !text.isEmpty, let components = URLComponents(string: text) else {
+            throw PairingError.invalidUrl("Gateway endpoint is not a valid URL")
         }
-        guard uri.user == nil && !(uri.host ?? "").isEmpty else {
-            fatalError("Gateway endpoint must not contain credentials")
+        guard components.scheme?.lowercased() == "https" else {
+            throw PairingError.invalidUrl("Gateway endpoint must use HTTPS")
         }
-        var base = "\(uri.scheme!.lowercased())://\(uri.host!.lowercased())"
-        if let port = uri.port {
+        guard components.user == nil, components.password == nil else {
+            throw PairingError.invalidUrl("Gateway endpoint must not contain credentials")
+        }
+        guard let host = components.host?.lowercased(), !host.isEmpty else {
+            throw PairingError.invalidUrl("Gateway endpoint must have an HTTPS host")
+        }
+        var base = "https://\(host)"
+        if let port = components.port {
             base += ":\(port)"
         }
-        return base.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return base
     }
 
     private struct HttpResult {

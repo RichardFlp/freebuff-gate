@@ -1,12 +1,28 @@
 import Foundation
 import Security
 
-class DeviceIdentity {
+/// Device identity keypair used for pairing.
+///
+/// Prefers a Secure Enclave–backed P-256 key where the hardware has one. The
+/// iOS Simulator (and Macs without a Secure Enclave) reject the enclave token
+/// attribute, so this falls back to a normal P-256 private key persisted in
+/// the Keychain. The public key encoding sent to the relay is identical in
+/// both cases (the uncompressed EC point, base64-encoded), so the pairing
+/// protocol and relay-side fingerprint are unaffected by the fallback.
+///
+/// Private key material is never logged or exported; only the public key
+/// leaves this type.
+final class DeviceIdentity {
     private let keyTag = "com.freebuff.gate.device-key"
+    private let keyTagData: Data
+
+    init() {
+        self.keyTagData = Data(keyTag.utf8)
+    }
 
     func publicKeyForPairing() throws -> String {
-        let keyPair = try loadOrCreateKeyPair()
-        guard let publicKey = SecKeyCopyPublicKey(keyPair) else {
+        let key = try loadOrCreateKey()
+        guard let publicKey = SecKeyCopyPublicKey(key) else {
             throw KeychainError.unexpected("No public key")
         }
         var error: Unmanaged<CFError>?
@@ -16,28 +32,66 @@ class DeviceIdentity {
         return data.base64EncodedString(options: [])
     }
 
-    private func loadOrCreateKeyPair() throws -> SecKey {
+    private func loadOrCreateKey() throws -> SecKey {
+        if let existing = try loadKey() {
+            return existing
+        }
+        // Prefer the Secure Enclave; fall back to a software key when the
+        // hardware/Simulator cannot host one.
+        if let enclaveKey = try? createKey(secureEnclave: true) {
+            return enclaveKey
+        }
+        return try createKey(secureEnclave: false)
+    }
+
+    private func loadKey() throws -> SecKey? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
-            kSecAttrApplicationTag as String: keyTag.data(using: .utf8)!,
+            kSecAttrApplicationTag as String: keyTagData,
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
             kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess {
-            return item as! SecKey
+        if status == errSecItemNotFound {
+            return nil
         }
-        if status != errSecItemNotFound {
+        guard status == errSecSuccess, let item else {
             throw KeychainError.unexpected("Key lookup failed (\(status))")
         }
+        // kSecReturnRef for key-class items returns a SecKey reference.
+        return (item as! SecKey)
+    }
 
-        let attributes: [String: Any] = [
+    private func createKey(secureEnclave: Bool) throws -> SecKey {
+        var privateAttributes: [String: Any] = [
+            kSecAttrIsPermanent as String: true,
+            kSecAttrApplicationTag as String: keyTagData,
+        ]
+        if secureEnclave {
+            guard let access = SecAccessControlCreateWithFlags(
+                nil,
+                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                [],
+                nil
+            ) else {
+                throw KeychainError.unexpected("Could not create key access control")
+            }
+            privateAttributes[kSecAttrAccessControl as String] = access
+        } else {
+            privateAttributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        }
+
+        var attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeySizeInBits as String: 256,
-            kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecAttrApplicationTag as String: keyTag.data(using: .utf8)!,
+            kSecPrivateKeyAttrs as String: privateAttributes,
         ]
+        if secureEnclave {
+            attributes[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
+        }
+
         var error: Unmanaged<CFError>?
         guard let key = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
             throw error?.takeRetainedValue() as? Error ?? KeychainError.unexpected("Could not create device key")

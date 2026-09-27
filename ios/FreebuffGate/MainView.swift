@@ -16,6 +16,8 @@ struct MainView: View {
 
     @StateObject private var controller = SessionController()
 
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some View {
         ZStack {
             Color(.systemBackground).ignoresSafeArea()
@@ -46,7 +48,11 @@ struct MainView: View {
                         showWebView = true
                     }
                 case .unpaired, .pairingRequired, .revoked, .disconnected:
+                    // Drop the active session and, best effort, clear the
+                    // relay-side APNs token so a disconnected or revoked
+                    // pairing stops receiving pushes.
                     PushTokenStore.shared.setSession(nil)
+                    PushTokenStore.shared.unregister()
                     showWebView = false
                 default:
                     break
@@ -55,6 +61,12 @@ struct MainView: View {
             controller.start()
         }
         .onDisappear { controller.close() }
+        .onChange(of: scenePhase) { phase in
+            // Foreground resume: the controller skips a redundant refresh while
+            // the access token is still fresh, so returning to the app never
+            // rotates a token the running WebView just used.
+            if phase == .active { controller.onResume() }
+        }
         .alert(
             "Open in browser?",
             isPresented: Binding(
@@ -112,6 +124,9 @@ struct MainView: View {
                 if hasSession {
                     Button("Disconnect", role: .destructive) {
                         controller.disconnect(clearSession: true)
+                        // Best effort: clear the relay-side APNs token before
+                        // the local session is gone.
+                        PushTokenStore.shared.unregister()
                         webTarget = nil
                         showWebView = false
                         pairingUrl = ""
@@ -167,7 +182,7 @@ struct MainView: View {
         Task {
             do {
                 let payload = try PairingPayload.parse(raw: raw)
-                if let configured = Self.configuredOrigin() {
+                if let configured = Self.configuredPairingOrigin() {
                     guard payload.baseUrl == configured else {
                         throw PairingError.invalidUrl("Pairing URL is not from configured Freebuff relay")
                     }
@@ -202,45 +217,74 @@ struct MainView: View {
               url.scheme == "https", url.host != nil else {
             return nil
         }
-        if let configured = Self.configuredOrigin(), RestrictedWebViewController.originOf(url.absoluteString) != configured {
+        if let configured = Self.configuredWebOrigin(),
+           RestrictedWebViewController.originOf(url.absoluteString) != configured {
             return nil
         }
         return url
     }
 
-    private static func configuredOrigin() -> String? {
-        let raw = Bundle.main.object(forInfoDictionaryKey: "FBDefaultWebOrigin") as? String ?? ""
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return PairingApi.normalizeBaseUrl(trimmed)
+    private static func configuredWebOrigin() -> String? {
+        OriginConfig.configuredOrigin(Bundle.main.object(forInfoDictionaryKey: "FBDefaultWebOrigin") as? String)
+    }
+
+    private static func configuredPairingOrigin() -> String? {
+        OriginConfig.configuredOrigin(Bundle.main.object(forInfoDictionaryKey: "FBDefaultPairingOrigin") as? String)
     }
 }
 
-/// Wraps the restricted WKWebView controller and installs the session cookie
-/// before the first load.
+/// Hosts the restricted WKWebView and establishes the relay web session once
+/// per session key.
 struct RestrictedWebViewHost: UIViewControllerRepresentable {
     let url: URL
     let controller: SessionController
     var onBlockedNavigation: (String) -> Void = { _ in }
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeUIViewController(context: Context) -> RestrictedWebViewController {
-        let vc = RestrictedWebViewController(
+        RestrictedWebViewController(
             allowedOrigin: RestrictedWebViewController.originOf(url.absoluteString) ?? "",
             onBlockedNavigation: onBlockedNavigation
         )
-        return vc
     }
 
-    func updateUIViewController(_ vc: RestrictedWebViewController, context: Context) {
-        Task {
-            // Establish the session cookie first, then load: the relay's UI
-            // page requires it before any API call succeeds.
-            if let session = controller.sessionStore.load(),
-               let cookie = try? await PairingApi(rawBaseUrl: session.gatewayBaseUrl)
-                   .establishWebSession(webBaseUrl: url.absoluteString, accessToken: session.accessToken) {
-                await vc.installCookie(cookie, for: url)
+    func updateUIViewController(_ viewController: RestrictedWebViewController, context: Context) {
+        context.coordinator.loadIfNeeded(
+            viewController: viewController,
+            url: url,
+            sessionStore: controller.sessionStore
+        )
+    }
+
+    /// SwiftUI re-invokes `updateUIViewController` on every state change, so
+    /// the load is funnelled through `WebSessionLoadGuard`: the relay session
+    /// is established once per (device, token, url) and an in-flight load is
+    /// never duplicated.
+    final class Coordinator {
+        private let loadGuard = WebSessionLoadGuard()
+
+        @MainActor
+        func loadIfNeeded(
+            viewController: RestrictedWebViewController,
+            url: URL,
+            sessionStore: SecureSessionStore
+        ) {
+            guard let session = sessionStore.load() else { return }
+            let key = WebSessionKey.make(session: session, url: url)
+            guard loadGuard.shouldLoad(key: key) else { return }
+            loadGuard.begin()
+            Task { @MainActor in
+                let cookie = try? await PairingApi(rawBaseUrl: session.gatewayBaseUrl)
+                    .establishWebSession(webBaseUrl: url.absoluteString, accessToken: session.accessToken)
+                if let cookie {
+                    await viewController.installCookie(cookie, for: url)
+                }
+                loadGuard.finish(key: key)
+                viewController.loadRemoteUi(url: url)
             }
-            vc.loadRemoteUi(url: url)
         }
     }
 }

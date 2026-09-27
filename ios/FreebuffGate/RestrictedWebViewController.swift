@@ -62,7 +62,7 @@ class RestrictedWebViewController: UIViewController, WKNavigationDelegate {
             decisionHandler(.cancel)
             return
         }
-        if isAllowed(target) {
+        if Self.isAllowed(target, allowedOrigin: allowedOrigin) {
             decisionHandler(.allow)
         } else {
             onBlockedNavigation(target.absoluteString)
@@ -70,10 +70,14 @@ class RestrictedWebViewController: UIViewController, WKNavigationDelegate {
         }
     }
 
-    private func isAllowed(_ url: URL) -> Bool {
-        url.scheme?.lowercased() == "https" && Self.originOf(url.absoluteString) == allowedOrigin
+    /// True only for HTTPS navigations whose origin exactly matches the pinned
+    /// relay origin: no other scheme, host, subdomain, or port.
+    static func isAllowed(_ url: URL, allowedOrigin: String) -> Bool {
+        url.scheme?.lowercased() == "https" && originOf(url.absoluteString) == allowedOrigin
     }
 
+    /// `scheme://host[:port]` with a lowercased host, or nil when the URL has
+    /// no scheme/host at all.
     static func originOf(_ raw: String) -> String? {
         guard let uri = URL(string: raw) else { return nil }
         var origin = "\(uri.scheme?.lowercased() ?? "")://\(uri.host?.lowercased() ?? "")"
